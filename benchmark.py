@@ -1,4 +1,4 @@
-
+import copy
 import os
 import time
 import tempfile
@@ -10,32 +10,43 @@ from sklearn.metrics import (
     accuracy_score,
     precision_score,
     recall_score,
-    f1_score
+    f1_score,
 )
 
-from model_manager import (
-    DEVICE,
-    get_test_loader
-)
+from model_manager import get_test_loader
 
 RESULTS_DIR = "results"
 
-def get_model_device(model):
-    try:
-        return next(model.parameters()).device
-    except StopIteration:
-        return torch.device("cpu")
+# Все измерения производительности выполняются только на CPU
+BENCHMARK_DEVICE = torch.device("cpu")
+
+torch.set_num_threads(
+    os.cpu_count()
+)
 
 # -------------------------------------------------
 # Создание папки результатов
 # -------------------------------------------------
 
 def create_results_folder():
+    os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    os.makedirs(
-        RESULTS_DIR,
-        exist_ok=True
-    )
+
+# -------------------------------------------------
+# Подготовка модели
+# -------------------------------------------------
+
+def prepare_model(model):
+    """
+    Создает независимую копию модели и переносит ее на CPU.
+    """
+
+    cpu_model = copy.deepcopy(model)
+
+    cpu_model.to(BENCHMARK_DEVICE)
+    cpu_model.eval()
+
+    return cpu_model
 
 
 # -------------------------------------------------
@@ -47,20 +58,18 @@ def get_model_size(model):
     with tempfile.NamedTemporaryFile(
             delete=False,
             suffix=".pth"
-    ) as temp_file:
+    ) as file:
+
         torch.save(
-            model.state_dict(),
-            temp_file.name
+            model,
+            file.name
         )
 
-        size_mb = (
-            os.path.getsize(temp_file.name)
-            / (1024 * 1024)
-        )
+        size = os.path.getsize(file.name)
 
-    os.remove(temp_file.name)
+    os.remove(file.name)
 
-    return round(size_mb, 2)
+    return round(size / (1024 * 1024), 2)
 
 
 # -------------------------------------------------
@@ -69,12 +78,9 @@ def get_model_size(model):
 
 def evaluate_model(model):
 
-    model.eval()
+    model = prepare_model(model)
 
     loader = get_test_loader()
-
-    # выбираем устройство по модели
-    device = get_model_device(model)
 
     y_true = []
     y_pred = []
@@ -83,70 +89,41 @@ def evaluate_model(model):
 
         for images, labels in loader:
 
-            images = images.to(device)
-            labels = labels.to(device)
+            images = images.to(BENCHMARK_DEVICE)
+            labels = labels.to(BENCHMARK_DEVICE)
 
             outputs = model(images)
 
-            predicted = outputs.argmax(dim=1)
+            prediction = outputs.argmax(dim=1)
 
-            y_true.extend(labels.cpu().numpy())
-            y_pred.extend(predicted.cpu().numpy())
+            y_true.extend(labels.numpy())
+            y_pred.extend(prediction.numpy())
 
-    metrics = {
+    return {
 
-        "Accuracy":
+        "Accuracy": accuracy_score(y_true, y_pred),
 
-            accuracy_score(
-                y_true,
-                y_pred
-            ),
+        "Precision": precision_score(
+            y_true,
+            y_pred,
+            average="macro",
+            zero_division=0
+        ),
 
-        "Precision":
+        "Recall": recall_score(
+            y_true,
+            y_pred,
+            average="macro",
+            zero_division=0
+        ),
 
-            precision_score(
-
-                y_true,
-
-                y_pred,
-
-                average="macro",
-
-                zero_division=0
-
-            ),
-
-        "Recall":
-
-            recall_score(
-
-                y_true,
-
-                y_pred,
-
-                average="macro",
-
-                zero_division=0
-
-            ),
-
-        "F1":
-
-            f1_score(
-
-                y_true,
-
-                y_pred,
-
-                average="macro",
-
-                zero_division=0
-
-            )
-
+        "F1": f1_score(
+            y_true,
+            y_pred,
+            average="macro",
+            zero_division=0
+        )
     }
-
-    return metrics
 
 
 # -------------------------------------------------
@@ -154,64 +131,41 @@ def evaluate_model(model):
 # -------------------------------------------------
 
 def measure_inference_time(
-
         model,
-
         runs=300
-
 ):
 
-    model.eval()
+    model = prepare_model(model)
 
     loader = get_test_loader()
 
     images, _ = next(iter(loader))
 
-    device = get_model_device(model)
+    images = images[:1]
 
-    images = images.to(device)
-
-    batch_size = images.shape[0]
+    images = images.to(BENCHMARK_DEVICE)
 
     with torch.no_grad():
 
         # прогрев
 
         for _ in range(20):
-
-            _ = model(images)
-
-        if torch.cuda.is_available():
-
-            torch.cuda.synchronize()
-
-            torch.cuda.empty_cache()
+            model(images)
 
         start = time.perf_counter()
 
         for _ in range(runs):
-
-            _ = model(images)
-
-        if torch.cuda.is_available():
-
-            torch.cuda.synchronize()
+            model(images)
 
         finish = time.perf_counter()
 
-    total_time = finish - start
+    total = finish - start
 
-    average_time = total_time / runs
+    avg = total / runs
 
-    fps = batch_size / average_time
+    fps = 1 / avg
 
-    return (
-
-        round(average_time * 1000, 3),
-
-        round(fps, 2)
-
-    )
+    return round(avg * 1000, 3), round(fps, 2)
 
 
 # -------------------------------------------------
@@ -219,13 +173,9 @@ def measure_inference_time(
 # -------------------------------------------------
 
 def benchmark_model(
-
         model,
-
         model_name,
-
         version
-
 ):
 
     metrics = evaluate_model(model)
@@ -240,73 +190,36 @@ def benchmark_model(
 
         "Version": version,
 
-        "Accuracy":
+        "Accuracy": round(metrics["Accuracy"], 4),
 
-            round(
-                metrics["Accuracy"],
-                4
-            ),
+        "Precision": round(metrics["Precision"], 4),
 
-        "Precision":
+        "Recall": round(metrics["Recall"], 4),
 
-            round(
-                metrics["Precision"],
-                4
-            ),
-
-        "Recall":
-
-            round(
-                metrics["Recall"],
-                4
-            ),
-
-        "F1":
-
-            round(
-                metrics["F1"],
-                4
-            ),
+        "F1": round(metrics["F1"], 4),
 
         "Time (ms)": inference_time,
 
         "FPS": fps,
 
         "Size (MB)": size
-
     }
 
-    print("\n")
-
+    print()
     print("=" * 70)
-
-    print(
-
-        f"{model_name} ({version})"
-
-    )
-
+    print(f"{model_name} ({version})")
     print("=" * 70)
 
     for key, value in result.items():
 
-        if key in [
-
-            "Model",
-
-            "Version"
-
-        ]:
-
+        if key in ("Model", "Version"):
             continue
 
-        print(
-
-            f"{key:<15}: {value}"
-
-        )
+        print(f"{key:<15}: {value}")
 
     return result
+
+
 # -------------------------------------------------
 # Сохранение результатов
 # -------------------------------------------------
@@ -315,52 +228,36 @@ def save_results(results):
 
     create_results_folder()
 
-    df = pd.DataFrame(results)
+    dataframe = pd.DataFrame(results)
 
     csv_path = os.path.join(
         RESULTS_DIR,
         "results.csv"
     )
 
-    #excel_path = os.path.join(
-    #    RESULTS_DIR,
-    #    "results.xlsx"
-    #)
-
     summary_path = os.path.join(
         RESULTS_DIR,
         "summary.csv"
     )
 
-    df.to_csv(
+    dataframe.to_csv(
         csv_path,
         index=False,
         encoding="utf-8-sig"
     )
 
-    #df.to_excel(
-    #    excel_path,
-    #    index=False
-    #)
-
-    summary = df.pivot_table(
+    summary = dataframe.pivot_table(
 
         index="Model",
 
         columns="Version",
 
         values=[
-
             "Accuracy",
-
             "Time (ms)",
-
             "FPS",
-
             "Size (MB)"
-
         ]
-
     )
 
     summary.to_csv(
@@ -368,111 +265,79 @@ def save_results(results):
         encoding="utf-8-sig"
     )
 
-    print("\n")
-
+    print()
     print("=" * 70)
-
     print("Результаты сохранены")
-
     print("=" * 70)
-
     print(csv_path)
-
-    #print(excel_path)
-
     print(summary_path)
 
-    return df
+    return dataframe
 
 
 # -------------------------------------------------
-# Поиск лучших моделей
+# Лучшие результаты
 # -------------------------------------------------
 
-def print_best_results(df):
+def print_best_results(dataframe):
 
-    print("\n")
-
+    print()
     print("=" * 70)
     print("ЛУЧШИЕ РЕЗУЛЬТАТЫ")
     print("=" * 70)
 
-    best_accuracy = df.loc[
-        df["Accuracy"].idxmax()
+    best_accuracy = dataframe.loc[
+        dataframe["Accuracy"].idxmax()
     ]
 
-    fastest = df.loc[
-        df["Time (ms)"].idxmin()
+    fastest = dataframe.loc[
+        dataframe["Time (ms)"].idxmin()
     ]
 
-    smallest = df.loc[
-        df["Size (MB)"].idxmin()
+    smallest = dataframe.loc[
+        dataframe["Size (MB)"].idxmin()
     ]
 
-    print("\nЛучшая Accuracy")
-
+    print("\nЛучшая Accuracy\n")
     print(best_accuracy)
 
-    print("\nСамая быстрая")
-
+    print("\nСамая быстрая\n")
     print(fastest)
 
-    print("\nСамая компактная")
-
+    print("\nСамая компактная\n")
     print(smallest)
 
 
 # -------------------------------------------------
-# Главное тестирование
+# Тестирование всех моделей
 # -------------------------------------------------
 
 def benchmark_models(
 
         original_models,
-
         int8_models,
-
         int4_models
 
 ):
 
+    print()
+    print("=" * 70)
+    print("ТЕСТИРОВАНИЕ МОДЕЛЕЙ (CPU)")
+    print("=" * 70)
+
     results = []
 
-    model_groups = [
+    groups = [
 
-        (
+        ("Original", original_models),
 
-            "Original",
+        ("INT8", int8_models),
 
-            original_models
-
-        ),
-
-        (
-
-            "INT8",
-
-            int8_models
-
-        ),
-
-        (
-
-            "INT4",
-
-            int4_models
-
-        )
+        ("INT4", int4_models)
 
     ]
 
-    print("\n")
-
-    print("=" * 70)
-    print("ТЕСТИРОВАНИЕ МОДЕЛЕЙ")
-    print("=" * 70)
-
-    for version, models in model_groups:
+    for version, models in groups:
 
         if models is None:
             continue
@@ -481,24 +346,25 @@ def benchmark_models(
 
         for model_name, model in models.items():
 
-            result = benchmark_model(
+            results.append(
 
-                model,
+                benchmark_model(
 
-                model_name,
+                    model,
 
-                version
+                    model_name,
+
+                    version
+
+                )
 
             )
-
-            results.append(result)
 
     dataframe = save_results(results)
 
     print_best_results(dataframe)
 
-    print("\n")
-
+    print()
     print("=" * 70)
     print("ИТОГОВАЯ ТАБЛИЦА")
     print("=" * 70)
@@ -509,32 +375,24 @@ def benchmark_models(
 
 
 # -------------------------------------------------
-# Загрузка сохранённых результатов
+# Загрузка результатов
 # -------------------------------------------------
 
 def load_results():
 
     path = os.path.join(
-
         RESULTS_DIR,
-
         "results.csv"
-
     )
 
     if not os.path.exists(path):
-
-        raise FileNotFoundError(
-
-            "Файл результатов не найден."
-
-        )
+        raise FileNotFoundError("Файл результатов не найден.")
 
     return pd.read_csv(path)
 
 
 # -------------------------------------------------
-# Получение данных для графиков
+# Данные для графиков
 # -------------------------------------------------
 
 def get_plot_data():
@@ -543,29 +401,17 @@ def get_plot_data():
 
     return {
 
-        "models":
+        "models": dataframe["Model"],
 
-            dataframe["Model"],
+        "versions": dataframe["Version"],
 
-        "versions":
+        "accuracy": dataframe["Accuracy"],
 
-            dataframe["Version"],
+        "time": dataframe["Time (ms)"],
 
-        "accuracy":
+        "fps": dataframe["FPS"],
 
-            dataframe["Accuracy"],
-
-        "time":
-
-            dataframe["Time (ms)"],
-
-        "fps":
-
-            dataframe["FPS"],
-
-        "size":
-
-            dataframe["Size (MB)"]
+        "size": dataframe["Size (MB)"]
 
     }
 
@@ -576,12 +422,4 @@ def get_plot_data():
 
 if __name__ == "__main__":
 
-    print(
-
-        "benchmark.py "
-
-        "используется "
-
-        "как модуль."
-
-    )
+    print("benchmark.py используется как модуль.")

@@ -26,7 +26,11 @@ from torch.utils.data import DataLoader
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
+CPU_DEVICE = torch.device("cpu")
 
+GPU_DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 NUM_CLASSES = 10
 
 BATCH_SIZE = 64
